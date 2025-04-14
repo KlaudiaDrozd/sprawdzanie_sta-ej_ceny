@@ -21,15 +21,15 @@ columns_to_check = [
     'Marketplace SK', 'Marketplace SE', 'Marketplace UAH'
 ]
 
-# Funkcja do wczytywania pliku z pamięcią podręczną
+# Funkcja do wczytywania pliku z pamięcią podręczną i wyborem kolumn
 @st.cache_data
-def load_file(uploaded_file):
+def load_file(uploaded_file, usecols):
     if uploaded_file is not None:
         try:
             if uploaded_file.name.endswith('.csv'):
-                return pd.read_csv(uploaded_file, low_memory=False, dtype={'index': str, 'Indeks': str, 'modelcolor': str})
+                return pd.read_csv(uploaded_file, low_memory=False, dtype={'index': str, 'Indeks': str, 'modelcolor': str}, usecols=usecols)
             elif uploaded_file.name.endswith('.xlsx'):
-                return pd.read_excel(uploaded_file, engine='openpyxl', dtype={'index': str, 'Indeks': str, 'modelcolor': str})
+                return pd.read_excel(uploaded_file, engine='openpyxl', dtype={'index': str, 'Indeks': str, 'modelcolor': str}, usecols=usecols)
         except Exception as e:
             st.error(f"Błąd wczytywania pliku {uploaded_file.name}: {str(e)}")
             return None
@@ -43,19 +43,21 @@ def clean_column_names(df):
 # Zoptymalizowana funkcja do sprawdzania spójności z pamięcią podręczną
 @st.cache_data
 def check_consistency(df, columns_to_check):
-    relevant_cols = ['modelcolor', 'index', 'Producent', 'Kat 1', 'last_delivery_date'] + columns_to_check
-    df_subset = df[relevant_cols].copy()
-
-    grouped = df_subset.groupby('modelcolor')
-    total_groups = len(grouped)
     result = []
-    progress_step = 0
-
-    for i, (modelcolor, group) in enumerate(grouped):
+    
+    # Grupowanie po modelcolor
+    grouped = df.groupby('modelcolor')
+    
+    # Iteracja po grupach
+    for modelcolor, group in grouped:
         for col in columns_to_check:
+            # Wektoryzowane sprawdzenie spójności
             values = group[col]
             non_null_values = values[values.isin([0, 1])]
+            
+            # Sprawdzamy, czy są różne wartości (niespójność)
             if non_null_values.nunique() > 1:
+                # Zgłaszamy wszystkie wiersze dla tej kolumny
                 for idx in group.index:
                     value = group.loc[idx, col]
                     if pd.isna(value) or value in [0, 1]:
@@ -80,9 +82,7 @@ def check_consistency(df, columns_to_check):
                             'problem_value': value,
                             'issue': f"Niepoprawna wartość w {col} (oczekiwano 0 lub 1)"
                         })
-
-        progress_step += 1
-
+    
     result_df = pd.DataFrame(result)
     if not result_df.empty:
         result_df = result_df.sort_values(by=['modelcolor', 'last_delivery_date'])
@@ -98,8 +98,7 @@ def highlight_issues(row):
                 break
     return styles
 
-# Funkcja do zapisu pliku Excel z podświetleniem (bez opisów kolumn)
-@st.cache_data
+# Funkcja do zapisu pliku Excel z podświetleniem (bez pamięci podręcznej, generowana na żądanie)
 def to_excel(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -130,10 +129,15 @@ uploaded_file1 = st.file_uploader("Wybierz plik z bazą danych", type=["csv", "x
 uploaded_file2 = st.file_uploader("Wybierz plik ze stałymi cenami", type=["csv", "xlsx"])
 
 if uploaded_file1 is not None and uploaded_file2 is not None:
-    # Wczytanie i czyszczenie danych
-    with st.spinner("Wczytywanie danych..."):
-        df_base = load_file(uploaded_file1)
-        df_prices = load_file(uploaded_file2)
+    # Definicja potrzebnych kolumn do wczytania
+    base_cols = ['index', 'modelcolor', 'last_delivery_date']
+    price_cols = ['Indeks', 'Producent', 'Kat 1'] + columns_to_check
+
+    # Wczytanie danych z wyborem kolumn
+    with st.spinner("Wczytywanie pliku z bazą danych..."):
+        df_base = load_file(uploaded_file1, usecols=base_cols)
+    with st.spinner("Wczytywanie pliku ze stałymi cenami..."):
+        df_prices = load_file(uploaded_file2, usecols=price_cols)
 
     if df_base is None or df_prices is None:
         st.error("Nie udało się wczytać jednego z plików. Sprawdź format lub zawartość.")
@@ -142,11 +146,8 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
         df_prices = clean_column_names(df_prices)
 
         # Sprawdzanie wymaganych kolumn
-        required_base_cols = ['index', 'modelcolor', 'last_delivery_date']
-        required_price_cols = ['Indeks', 'Producent', 'Kat 1'] + columns_to_check
-
-        missing_base_cols = [col for col in required_base_cols if col not in df_base.columns]
-        missing_price_cols = [col for col in required_price_cols if col not in df_prices.columns]
+        missing_base_cols = [col for col in base_cols if col not in df_base.columns]
+        missing_price_cols = [col for col in price_cols if col not in df_prices.columns]
 
         if missing_base_cols or missing_price_cols:
             st.error(f"Brakujące kolumny w pliku z bazą: {missing_base_cols}, w pliku z cenami: {missing_price_cols}")
@@ -181,19 +182,19 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
             # Łączenie danych z pamięcią podręczną
             @st.cache_data
             def merge_data(df_base, df_prices, selected_modelcolors, selected_producents):
-                merged_df = pd.merge(df_base[['index', 'modelcolor', 'last_delivery_date']],
-                                    df_prices[['index', 'Producent', 'Kat 1'] + columns_to_check],
-                                    how='left',
-                                    on='index')
-                if selected_modelcolors:
-                    merged_df = merged_df[merged_df['modelcolor'].isin(selected_modelcolors)]
-                if selected_producents:
-                    merged_df = merged_df[merged_df['Producent'].isin(selected_producents)]
+                with st.spinner("Łączenie danych..."):
+                    merged_df = pd.merge(df_base[['index', 'modelcolor', 'last_delivery_date']],
+                                        df_prices[['index', 'Producent', 'Kat 1'] + columns_to_check],
+                                        how='left',
+                                        on='index')
+                    if selected_modelcolors:
+                        merged_df = merged_df[merged_df['modelcolor'].isin(selected_modelcolors)]
+                    if selected_producents:
+                        merged_df = merged_df[merged_df['Producent'].isin(selected_producents)]
                 return merged_df
 
             # Łączenie danych
-            with st.spinner("Łączenie danych..."):
-                merged_df = merge_data(df_base, df_prices, selected_modelcolors, selected_producents)
+            merged_df = merge_data(df_base, df_prices, selected_modelcolors, selected_producents)
 
             # Diagnostyka: Wyświetlenie danych po złączeniu dla wybranego modelcolor
             if selected_modelcolors:
@@ -203,11 +204,9 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
                     modelcolor_data = merged_df[merged_df['modelcolor'] == modelcolor][['index', 'Producent', 'Kat 1', 'last_delivery_date'] + columns_to_check]
                     st.dataframe(modelcolor_data)
 
-            # Sprawdzanie spójności z paskiem postępu
-            st.write("Sprawdzanie spójności binarnych danych stałych cen...")
-            progress_bar = st.progress(0)
-            issues_df = check_consistency(merged_df, columns_to_check)
-            progress_bar.progress(1.0)
+            # Sprawdzanie spójności
+            with st.spinner("Sprawdzanie spójności binarnych danych stałych cen..."):
+                issues_df = check_consistency(merged_df, columns_to_check)
 
             # Wybór liczby wierszy do wyświetlenia
             st.subheader("Ustawienia wyświetlania")
@@ -224,13 +223,16 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
                 styled_issues = issues_df.head(display_rows).style.apply(highlight_issues, axis=1)
                 st.dataframe(styled_issues)
 
-                # Pobieranie pliku z raportem
-                excel_data = to_excel(issues_df)
-                st.download_button(
-                    label="Pobierz raport z problemami (Excel)",
-                    data=excel_data,
-                    file_name="issues_report.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
+                # Pobieranie pliku z raportem (generowanie na żądanie)
+                if st.button("Pobierz raport z problemami (Excel)"):
+                    with st.spinner("Generowanie pliku Excel..."):
+                        excel_data = to_excel(issues_df)
+                    st.download_button(
+                        label="Pobierz raport (Excel)",
+                        data=excel_data,
+                        file_name="issues_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_excel"
+                    )
 else:
     st.info("Proszę załadować oba pliki, aby kontynuować.")
