@@ -4,6 +4,8 @@ from io import BytesIO
 import numpy as np
 from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
+from joblib import Parallel, delayed
+import time
 
 # Ustawienie limitu komórek dla Pandas Styler
 pd.set_option("styler.render.max_elements", 3000000)
@@ -31,7 +33,6 @@ def load_file(uploaded_file, usecols, chunksize=10000):
                 for chunk in pd.read_csv(uploaded_file, low_memory=False, dtype={'index': str, 'Indeks': str, 'modelcolor': str}, usecols=usecols, chunksize=chunksize):
                     chunks.append(chunk)
             elif uploaded_file.name.endswith('.xlsx'):
-                # Excel nie obsługuje chunkingu natywnie, więc wczytujemy całość, ale z wyborem kolumn
                 return pd.read_excel(uploaded_file, engine='openpyxl', dtype={'index': str, 'Indeks': str, 'modelcolor': str}, usecols=usecols)
             return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         except Exception as e:
@@ -44,38 +45,45 @@ def clean_column_names(df):
     df.columns = df.columns.str.strip()
     return df
 
-# Zoptymalizowana funkcja do sprawdzania spójności
+# Funkcja do sprawdzania spójności dla jednej kolumny (do równoległego przetwarzania)
+def check_column_consistency(df, col):
+    # Grupowanie po modelcolor i sprawdzenie spójności
+    grouped = df.groupby('modelcolor')[col]
+    non_null_counts = grouped.apply(lambda x: x[x.isin([0, 1])].nunique())
+    inconsistent_modelcolors = non_null_counts[non_null_counts > 1].index
+
+    if len(inconsistent_modelcolors) == 0:
+        return pd.DataFrame()
+
+    # Tworzenie raportu dla niespójnych modelcolor
+    inconsistent_df = df[df['modelcolor'].isin(inconsistent_modelcolors)][['modelcolor', 'index', 'Producent', 'Kat 1', 'last_delivery_date']].copy()
+    inconsistent_df['problem_column'] = col
+    inconsistent_df['problem_value'] = df.loc[inconsistent_df.index, col]
+    inconsistent_df['issue'] = np.where(
+        inconsistent_df['problem_value'].isin([0, 1]) | inconsistent_df['problem_value'].isna(),
+        f"Niespójność w {col} (różne wartości 0/1)",
+        f"Niepoprawna wartość w {col} (oczekiwano 0 lub 1)"
+    )
+    return inconsistent_df
+
+# Zoptymalizowana funkcja do sprawdzania spójności z równoległym przetwarzaniem
 @st.cache_data
 def check_consistency(df, columns_to_check):
-    result = []
-    
-    # Grupowanie po modelcolor
-    grouped = df.groupby('modelcolor')
-    
-    # Wektoryzowane sprawdzanie spójności dla każdej grupy
-    for modelcolor, group in grouped:
-        for col in columns_to_check:
-            values = group[col]
-            non_null_values = values[values.isin([0, 1])]
-            
-            # Sprawdzamy, czy są różne wartości (niespójność)
-            if non_null_values.nunique() > 1:
-                # Wektoryzowane tworzenie raportu
-                temp_df = group[['index', 'Producent', 'Kat 1', 'last_delivery_date']].copy()
-                temp_df['modelcolor'] = modelcolor
-                temp_df['problem_column'] = col
-                temp_df['problem_value'] = group[col]
-                temp_df['issue'] = np.where(
-                    temp_df['problem_value'].isin([0, 1]) | temp_df['problem_value'].isna(),
-                    f"Niespójność w {col} (różne wartości 0/1)",
-                    f"Niepoprawna wartość w {col} (oczekiwano 0 lub 1)"
-                )
-                result.append(temp_df)
+    start_time = time.time()
+    st.write(f"Rozpoczęcie sprawdzania spójności: {time.strftime('%H:%M:%S')}")
+
+    # Równoległe sprawdzanie spójności dla każdej kolumny
+    results = Parallel(n_jobs=-1)(
+        delayed(check_column_consistency)(df, col) for col in columns_to_check
+    )
 
     # Łączenie wyników
-    result_df = pd.concat(result, ignore_index=True) if result else pd.DataFrame()
+    result_df = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     if not result_df.empty:
         result_df = result_df.sort_values(by=['modelcolor', 'last_delivery_date'])
+
+    end_time = time.time()
+    st.write(f"Zakończono sprawdzanie spójności w {end_time - start_time:.2f} sekund: {time.strftime('%H:%M:%S')}")
     return result_df
 
 # Funkcja do podświetlania tylko problematycznej wartości w Streamlit
@@ -114,9 +122,10 @@ def to_excel(df):
 # Tytuł aplikacji
 st.title("Sprawdzanie spójności binarnych danych stałych cen")
 
-# Opcja ograniczenia liczby wierszy (dla testów)
+# Opcje wczytywania danych
 st.subheader("Ustawienia wczytywania danych")
 chunk_size = st.number_input("Wczytaj dane w partiach (rozmiar partii, 0 = wczytaj całość):", min_value=0, value=10000, step=1000)
+max_rows = st.number_input("Maksymalna liczba wierszy do analizy (0 = bez limitu):", min_value=0, value=50000, step=10000)
 
 # Wczytanie plików
 uploaded_file1 = st.file_uploader("Wybierz plik z bazą danych", type=["csv", "xlsx"])
@@ -128,16 +137,23 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
     price_cols = ['Indeks', 'Producent', 'Kat 1'] + columns_to_check
 
     # Wczytanie danych w partiach
+    start_time = time.time()
     with st.spinner("Wczytywanie pliku z bazą danych..."):
         df_base = load_file(uploaded_file1, usecols=base_cols, chunksize=chunk_size if chunk_size > 0 else None)
     with st.spinner("Wczytywanie pliku ze stałymi cenami..."):
         df_prices = load_file(uploaded_file2, usecols=price_cols, chunksize=chunk_size if chunk_size > 0 else None)
+    st.write(f"Wczytywanie danych trwało {time.time() - start_time:.2f} sekund")
 
     if df_base is None or df_prices is None:
         st.error("Nie udało się wczytać jednego z plików. Sprawdź format lub zawartość.")
     elif df_base.empty or df_prices.empty:
         st.error("Wczytane pliki są puste. Sprawdź ich zawartość.")
     else:
+        # Ograniczenie liczby wierszy, jeśli ustawiono limit
+        if max_rows > 0:
+            df_base = df_base.head(max_rows)
+            df_prices = df_prices.head(max_rows)
+
         df_base = clean_column_names(df_base)
         df_prices = clean_column_names(df_prices)
 
@@ -151,17 +167,18 @@ if uploaded_file1 is not None and uploaded_file2 is not None:
             # Normalizacja nazw kolumn
             df_prices = df_prices.rename(columns={'Indeks': 'index'})
 
-            # Łączenie danych (tylko raz, na początku)
+            # Łączenie danych
             @st.cache_data
             def merge_data(df_base, df_prices):
+                start_time = time.time()
                 with st.spinner("Łączenie danych..."):
                     merged_df = pd.merge(df_base[['index', 'modelcolor', 'last_delivery_date']],
                                         df_prices[['index', 'Producent', 'Kat 1'] + columns_to_check],
                                         how='left',
                                         on='index')
+                st.write(f"Łączenie danych trwało {time.time() - start_time:.2f} sekund")
                 return merged_df
 
-            # Łączenie danych
             merged_df = merge_data(df_base, df_prices)
 
             # Filtrowanie po modelcolor z wyszukiwaniem
